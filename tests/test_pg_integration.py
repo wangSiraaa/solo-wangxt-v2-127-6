@@ -96,3 +96,32 @@ def test_idempotent_schema_init(pg_client):
     # creating a second repository over the same DSN must not error on DDL
     arch.repo.init_schema()
     assert c.get("/health").status_code == 200
+
+
+def test_integrity_inspection_roundtrip(pg_client):
+    c, arch = pg_client
+    r = _post(c, "01_multibyte.eml")
+    pk = r.json()["message_pk"]
+    ok_run = c.post("/inspections").json()
+    assert ok_run["status"] == "ok"
+    assert ok_run["items_failed"] == 0
+    assert ok_run["ingests_checked"] == 1
+
+    # remove one attachment: the failure must be located, batch still completes
+    msg = c.get(f"/messages/{pk}").json()
+    victim = msg["attachments"][0]
+    arch.attachment_storage.resolve(victim["storage_path"]).unlink()
+    bad_run = c.post("/inspections").json()
+    assert bad_run["status"] == "failed"
+    assert bad_run["items_failed"] == 1
+    failures = c.get(f"/inspections/{bad_run['id']}/failures").json()
+    assert len(failures) == 1
+    assert failures[0]["message_pk"] == pk
+    assert failures[0]["mime_path"] == victim["mime_path"]
+    assert failures[0]["item_kind"] == "attachment"
+
+    # both runs persisted; message metadata unaffected; download still fails
+    assert len(c.get("/inspections").json()) == 2
+    assert c.get(f"/messages/{pk}").status_code == 200
+    dl = c.get(f"/messages/{pk}/attachments/{victim['id']}/download")
+    assert dl.status_code == 410

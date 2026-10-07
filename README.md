@@ -49,6 +49,25 @@ Implemented in `app/threads.py` (pure function, unit tested):
 * Reference cycles are detected with bounded three-color DFS (`cycles`);
   dangling references (`dangling_references`) are reported, not hidden.
 
+## Integrity inspection (巡检)
+
+Archivists can re-verify controlled storage at any time (`app/integrity.py`):
+
+* **Read-only**: raw EMLs and attachments are only opened for reading; runs
+  write solely to the `inspection_runs` / `inspection_items` audit tables.
+  Evidence rows and files are never modified, overwritten or deleted.
+* **Per ingest batch**: every run re-reads the raw EML and every stored
+  attachment of each ingest in scope, comparing recorded size and SHA-256,
+  and validates reference relationships (ingest → raw file, message → ingest
+  digest, attachment → message / `stored` flag consistency).
+* **Fault isolation**: one missing/corrupt file produces exactly one failed
+  item; the rest of the batch is inspected to completion.
+* **Locatable failures**: each item carries `ingest_id`, `message_pk` and
+  `mime_path`, so a failure points back to the exact mail and MIME part.
+* Every run persists its time range, scope (`{"all": true}` or
+  `{"ingest_ids": [...]}`) and per-item results; repeated runs accumulate as
+  separate records.
+
 ## API
 
 | Method | Path | Purpose |
@@ -61,6 +80,9 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
 | GET | `/failures` | failed/defective ingests with their defect lists |
+| POST | `/inspections` | run a read-only integrity inspection (`?ingest_ids=` to restrict the batch); returns run summary |
+| GET | `/inspections` / `/inspections/{id}` | persisted runs / one run with every per-item result |
+| GET | `/inspections/{id}/failures` | failed items of a run (message + MIME path located) |
 | GET | `/health` | backend and configured storage roots |
 
 ## Running
@@ -91,7 +113,7 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # 58 unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
 ```
@@ -114,6 +136,7 @@ app/
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
+  integrity.py         read-only inspection runs over controlled storage
   pg_repository.py     PostgreSQL persistence (psycopg3)
   memory_repository.py same interface, in-memory (tests / demo)
   service.py           parse -> store -> persist -> thread orchestration

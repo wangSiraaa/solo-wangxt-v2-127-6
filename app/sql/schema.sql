@@ -119,3 +119,36 @@ CREATE TABLE IF NOT EXISTS thread_runs (
 
 -- Provenance link: raw EML digest -> every ingest/parse result of that bytes.
 CREATE INDEX IF NOT EXISTS idx_ingests_sha ON ingests(raw_sha256);
+
+-- Integrity inspection (巡检) audit log. These tables are append-only records
+-- *about* evidence; item rows deliberately carry no FK to ingests/messages so
+-- the audit trail survives even if evidence rows are ever removed.
+CREATE TABLE IF NOT EXISTS inspection_runs (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    started_at      TIMESTAMPTZ NOT NULL,
+    finished_at     TIMESTAMPTZ,
+    scope           JSONB NOT NULL DEFAULT '{}',  -- {"all": true} | {"ingest_ids": [...]}
+    ingests_checked INT NOT NULL DEFAULT 0,
+    items_checked   INT NOT NULL DEFAULT 0,
+    items_ok        INT NOT NULL DEFAULT 0,
+    items_failed    INT NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL CHECK (status IN ('ok','failed'))
+);
+
+CREATE TABLE IF NOT EXISTS inspection_items (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id          BIGINT NOT NULL REFERENCES inspection_runs(id) ON DELETE CASCADE,
+    ingest_id       BIGINT,
+    message_pk      BIGINT,
+    item_kind       TEXT NOT NULL CHECK (item_kind IN ('raw','attachment','reference')),
+    mime_path       TEXT,
+    storage_path    TEXT,
+    expected_size   BIGINT,
+    actual_size     BIGINT,
+    expected_sha256 TEXT,
+    actual_sha256   TEXT,
+    status          TEXT NOT NULL CHECK (status IN ('ok','failed')),
+    detail          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inspection_items_run ON inspection_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_inspection_items_status ON inspection_items(status);

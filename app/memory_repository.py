@@ -28,9 +28,13 @@ class MemoryRepository:
         self.attachments: list[dict[str, Any]] = []
         self.defects: list[dict[str, Any]] = []
         self.thread_runs: list[dict[str, Any]] = []
+        self.inspection_runs: dict[int, dict[str, Any]] = {}
+        self.inspection_items: list[dict[str, Any]] = []
         self._ingest_seq = 0
         self._msg_seq = 0
         self._att_seq = 0
+        self._run_seq = 0
+        self._item_seq = 0
 
     def init_schema(self) -> None:  # nothing to do
         return None
@@ -326,3 +330,77 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    # -- integrity inspection -------------------------------------------------
+    def list_ingest_file_refs(self, ingest_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
+        wanted = set(ingest_ids) if ingest_ids is not None else None
+        refs: list[dict[str, Any]] = []
+        for ing_id in sorted(self.ingests):
+            if wanted is not None and ing_id not in wanted:
+                continue
+            ing = self.ingests[ing_id]
+            msgs = sorted(
+                (m for m in self.messages.values() if m["ingest_id"] == ing_id),
+                key=lambda m: m["id"],
+            )
+            msg_pks = {m["id"] for m in msgs}
+            atts = sorted(
+                (a for a in self.attachments if a["message_pk"] in msg_pks),
+                key=lambda a: a["id"],
+            )
+            refs.append(
+                {
+                    "ingest_id": ing_id,
+                    "status": ing["status"],
+                    "raw_sha256": ing["raw_sha256"],
+                    "raw_size": ing["raw_size"],
+                    "raw_path": ing["raw_path"],
+                    "messages": [{"id": m["id"], "raw_sha256": m["raw_sha256"]} for m in msgs],
+                    "attachments": [
+                        {
+                            "id": a["id"],
+                            "message_pk": a["message_pk"],
+                            "mime_path": a["mime_path"],
+                            "byte_size": a["byte_size"],
+                            "checksum_sha256": a["checksum_sha256"],
+                            "storage_path": a["storage_path"],
+                            "stored": a["stored"],
+                        }
+                        for a in atts
+                    ],
+                }
+            )
+        return refs
+
+    def save_inspection(self, run: dict[str, Any], items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        self._run_seq += 1
+        run_id = self._run_seq
+        record = dict(run, id=run_id)
+        self.inspection_runs[run_id] = record
+        for item in items:
+            self._item_seq += 1
+            self.inspection_items.append(dict(item, id=self._item_seq, run_id=run_id))
+        return dict(record)
+
+    def list_inspections(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        ordered = sorted(self.inspection_runs.values(), key=lambda r: r["id"], reverse=True)
+        return [dict(r) for r in ordered[offset : offset + limit]]
+
+    def get_inspection(self, run_id: int) -> dict[str, Any] | None:
+        run = self.inspection_runs.get(run_id)
+        if not run:
+            return None
+        out = dict(run)
+        out["items"] = [dict(i) for i in self.inspection_items if i["run_id"] == run_id]
+        return out
+
+    def list_inspection_failures(
+        self, run_id: int | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        rows = [
+            dict(i)
+            for i in self.inspection_items
+            if i["status"] == "failed" and (run_id is None or i["run_id"] == run_id)
+        ]
+        rows.sort(key=lambda i: i["id"])
+        return rows[offset : offset + limit]

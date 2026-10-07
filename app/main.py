@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
 
 from app.config import Settings, get_settings
+from app.integrity import IntegrityService
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
@@ -20,6 +21,9 @@ from app.schemas import (
     Health,
     IngestDetail,
     IngestResponse,
+    InspectionItemOut,
+    InspectionRunDetail,
+    InspectionRunOut,
     MessageDetail,
     MessageSummary,
     SearchResponse,
@@ -47,6 +51,7 @@ class AppState:
             self.backend = "memory"
         self.repo.init_schema()
         self.service = IngestService(self.repo, self.raw_storage, self.attachment_storage)
+        self.integrity = IntegrityService(self.repo, self.raw_storage, self.attachment_storage)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -161,6 +166,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         offset: int = Query(0, ge=0),
     ) -> list[dict[str, Any]]:
         return get_state(request).repo.list_failures(limit, offset)
+
+    # ---- integrity inspection (read-only) ---------------------------------
+    @app.post("/inspections", response_model=InspectionRunOut, status_code=201, tags=["inspection"])
+    def run_inspection(
+        request: Request,
+        ingest_ids: list[int] | None = Query(
+            default=None, description="restrict the batch to these ingest ids; default: all"
+        ),
+    ) -> dict[str, Any]:
+        st = get_state(request)
+        return st.integrity.run_inspection(ingest_ids=ingest_ids)
+
+    @app.get("/inspections", response_model=list[InspectionRunOut], tags=["inspection"])
+    def list_inspections(
+        request: Request,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        return get_state(request).repo.list_inspections(limit, offset)
+
+    @app.get("/inspections/{run_id}", response_model=InspectionRunDetail, tags=["inspection"])
+    def get_inspection(request: Request, run_id: int) -> dict[str, Any]:
+        run = get_state(request).repo.get_inspection(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="inspection run not found")
+        return run
+
+    @app.get(
+        "/inspections/{run_id}/failures",
+        response_model=list[InspectionItemOut],
+        tags=["inspection"],
+    )
+    def inspection_failures(
+        request: Request,
+        run_id: int,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        st = get_state(request)
+        if st.repo.get_inspection(run_id) is None:
+            raise HTTPException(status_code=404, detail="inspection run not found")
+        return st.repo.list_inspection_failures(run_id, limit, offset)
 
     # ---- threads ---------------------------------------------------------
     @app.get("/threads", response_model=list[ThreadSummary], tags=["threads"])

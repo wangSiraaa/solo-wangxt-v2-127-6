@@ -154,3 +154,35 @@ class Health(BaseModel):
     status: str
     backend: str
     storage_roots: dict[str, str]
+
+
+class InspectionItemOut(BaseModel):
+    id: int
+    run_id: int
+    ingest_id: int | None
+    message_pk: int | None
+    item_kind: str  # raw | attachment | reference
+    mime_path: str | None = None
+    storage_path: str | None = None
+    expected_size: int | None = None
+    actual_size: int | None = None
+    expected_sha256: str | None = None
+    actual_sha256: str | None = None
+    status: str  # ok | failed
+    detail: str | None = None
+
+
+class InspectionRunOut(BaseModel):
+    id: int
+    started_at: datetime
+    finished_at: datetime | None
+    scope: dict[str, Any]
+    ingests_checked: int
+    items_checked: int
+    items_ok: int
+    items_failed: int
+    status: str  # ok | failed
+
+
+class InspectionRunDetail(InspectionRunOut):
+    items: list[InspectionItemOut]

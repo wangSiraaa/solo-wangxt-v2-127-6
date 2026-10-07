@@ -374,6 +374,154 @@ class PgRepository:
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
 
+    # -- integrity inspection -------------------------------------------------
+    def list_ingest_file_refs(self, ingest_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if ingest_ids is None:
+                cur.execute(
+                    "SELECT id, status, raw_sha256, raw_size, raw_path FROM ingests ORDER BY id"
+                )
+            else:
+                cur.execute(
+                    "SELECT id, status, raw_sha256, raw_size, raw_path FROM ingests "
+                    "WHERE id = ANY(%s) ORDER BY id",
+                    (list(ingest_ids),),
+                )
+            refs: list[dict[str, Any]] = []
+            by_id: dict[int, dict[str, Any]] = {}
+            for ing_id, status, sha, size, path in cur.fetchall():
+                ref = {
+                    "ingest_id": ing_id,
+                    "status": status,
+                    "raw_sha256": sha,
+                    "raw_size": size,
+                    "raw_path": path,
+                    "messages": [],
+                    "attachments": [],
+                }
+                refs.append(ref)
+                by_id[ing_id] = ref
+            if not refs:
+                return []
+            cur.execute(
+                "SELECT id, ingest_id, raw_sha256 FROM messages "
+                "WHERE ingest_id = ANY(%s) ORDER BY id",
+                (list(by_id),),
+            )
+            msg_to_ref: dict[int, dict[str, Any]] = {}
+            for pk, ing_id, sha in cur.fetchall():
+                by_id[ing_id]["messages"].append({"id": pk, "raw_sha256": sha})
+                msg_to_ref[pk] = by_id[ing_id]
+            if msg_to_ref:
+                cur.execute(
+                    """
+                    SELECT id, message_pk, mime_path, byte_size, checksum_sha256,
+                           storage_path, stored
+                    FROM attachments WHERE message_pk = ANY(%s) ORDER BY id
+                    """,
+                    (list(msg_to_ref),),
+                )
+                cols = [c.name for c in cur.description]
+                for row in cur.fetchall():
+                    att = dict(zip(cols, row))
+                    msg_to_ref[att["message_pk"]]["attachments"].append(att)
+            return refs
+
+    def save_inspection(self, run: dict[str, Any], items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO inspection_runs (started_at, finished_at, scope, ingests_checked,
+                                             items_checked, items_ok, items_failed, status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                """,
+                (
+                    _dt(run["started_at"]),
+                    _dt(run["finished_at"]),
+                    Jsonb(run["scope"]),
+                    run["ingests_checked"],
+                    run["items_checked"],
+                    run["items_ok"],
+                    run["items_failed"],
+                    run["status"],
+                ),
+            )
+            run_id = cur.fetchone()[0]
+            cur.executemany(
+                """
+                INSERT INTO inspection_items (run_id, ingest_id, message_pk, item_kind,
+                    mime_path, storage_path, expected_size, actual_size,
+                    expected_sha256, actual_sha256, status, detail)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                [
+                    (
+                        run_id,
+                        i["ingest_id"],
+                        i["message_pk"],
+                        i["item_kind"],
+                        i["mime_path"],
+                        i["storage_path"],
+                        i["expected_size"],
+                        i["actual_size"],
+                        i["expected_sha256"],
+                        i["actual_sha256"],
+                        i["status"],
+                        i["detail"],
+                    )
+                    for i in items
+                ],
+            )
+            conn.commit()
+        return {"id": run_id, **run}
+
+    def list_inspections(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, started_at, finished_at, scope, ingests_checked,
+                       items_checked, items_ok, items_failed, status
+                FROM inspection_runs ORDER BY id DESC LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
+    def get_inspection(self, run_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM inspection_runs WHERE id = %s", (run_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            out = dict(zip(cols, row))
+            cur.execute(
+                "SELECT * FROM inspection_items WHERE run_id = %s ORDER BY id", (run_id,)
+            )
+            cols = [c.name for c in cur.description]
+            out["items"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            return _jsonify(out)
+
+    def list_inspection_failures(
+        self, run_id: int | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if run_id is None:
+                cur.execute(
+                    "SELECT * FROM inspection_items WHERE status = 'failed' "
+                    "ORDER BY id LIMIT %s OFFSET %s",
+                    (limit, offset),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM inspection_items WHERE status = 'failed' AND run_id = %s "
+                    "ORDER BY id LIMIT %s OFFSET %s",
+                    (run_id, limit, offset),
+                )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
 
 def _jsonify(value: Any) -> Any:
     """Decode Jsonb values already parsed by psycopg (dicts/lists) — pass through."""
