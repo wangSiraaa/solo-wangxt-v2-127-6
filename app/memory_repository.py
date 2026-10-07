@@ -28,9 +28,12 @@ class MemoryRepository:
         self.attachments: list[dict[str, Any]] = []
         self.defects: list[dict[str, Any]] = []
         self.thread_runs: list[dict[str, Any]] = []
+        self.integrity_runs: dict[int, dict[str, Any]] = {}
+        self.integrity_items: list[dict[str, Any]] = []
         self._ingest_seq = 0
         self._msg_seq = 0
         self._att_seq = 0
+        self._integrity_seq = 0
 
     def init_schema(self) -> None:  # nothing to do
         return None
@@ -326,3 +329,120 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        for a in self.attachments:
+            if a["id"] == attachment_id and a["message_pk"] == message_pk:
+                return dict(a)
+        return None
+
+    # -- integrity patrol --------------------------------------------------
+    def integrity_targets(self, ingest_ids: Sequence[int] | None) -> list[dict[str, Any]]:
+        ids = set(ingest_ids) if ingest_ids is not None else None
+        targets: list[dict[str, Any]] = []
+        for ing in self.ingests.values():
+            if ids is not None and ing["id"] not in ids:
+                continue
+            pks = [m["id"] for m in self.messages.values() if m["ingest_id"] == ing["id"]]
+            pk = pks[0] if pks else None
+            message = self.messages.get(pk) if pk is not None else None
+            targets.append(
+                {
+                    "ingest_id": ing["id"],
+                    "message_pk": pk,
+                    "target_type": "raw",
+                    "attachment_id": None,
+                    "message_id": message["message_id"] if message else None,
+                    "subject": message["subject"] if message else None,
+                    "mime_path": None,
+                    "storage_path": ing["raw_path"],
+                    "expected_sha256": ing["raw_sha256"],
+                    "expected_size": ing["raw_size"],
+                    "stored": ing["raw_path"] is not None,
+                }
+            )
+            if pk is not None:
+                for a in self.attachments:
+                    if a["message_pk"] != pk:
+                        continue
+                    targets.append(
+                        {
+                            "ingest_id": ing["id"],
+                            "message_pk": pk,
+                            "target_type": "attachment",
+                            "attachment_id": a["id"],
+                            "message_id": message["message_id"],
+                            "subject": message["subject"],
+                            "mime_path": a["mime_path"],
+                            "storage_path": a["storage_path"],
+                            "expected_sha256": a["checksum_sha256"],
+                            "expected_size": a["byte_size"],
+                            "stored": bool(a["stored"] and a["storage_path"]),
+                        }
+                    )
+        targets.sort(key=lambda t: (t["ingest_id"], 0 if t["target_type"] == "raw" else 1,
+                                    t["attachment_id"] or 0))
+        return targets
+
+    def create_integrity_run(
+        self, *, scope: str, scope_ingest_ids: Sequence[int], ingest_count: int
+    ) -> int:
+        self._integrity_seq += 1
+        run_id = self._integrity_seq
+        self.integrity_runs[run_id] = {
+            "id": run_id,
+            "started_at": datetime.now(timezone.utc),
+            "finished_at": None,
+            "status": "running",
+            "scope": scope,
+            "scope_ingest_ids": list(scope_ingest_ids),
+            "ingest_count": ingest_count,
+            "item_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+        }
+        return run_id
+
+    def add_integrity_items(self, run_id: int, items: Sequence[dict[str, Any]]) -> None:
+        for item in items:
+            row = dict(item)
+            row.setdefault("id", len(self.integrity_items) + 1)
+            self.integrity_items.append(row)
+
+    def complete_integrity_run(
+        self, run_id: int, *, item_count: int, passed: int, failed: int, skipped: int
+    ) -> None:
+        run = self.integrity_runs[run_id]
+        run.update(
+            status="completed",
+            finished_at=datetime.now(timezone.utc),
+            item_count=item_count,
+            passed_count=passed,
+            failed_count=failed,
+            skipped_count=skipped,
+        )
+
+    def get_integrity_run(self, run_id: int) -> dict[str, Any] | None:
+        run = self.integrity_runs.get(run_id)
+        if run is None:
+            return None
+        out = dict(run)
+        out["items"] = [
+            dict(i) for i in self.integrity_items if i["run_id"] == run_id
+        ]
+        return out
+
+    def list_integrity_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        ordered = [dict(r) for r in self.integrity_runs.values()]
+        ordered.sort(key=lambda r: r["id"], reverse=True)
+        return ordered[offset : offset + limit]
+
+    def list_integrity_items(
+        self, run_id: int, *, status: str | None = None, limit: int = 500, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        rows = [dict(i) for i in self.integrity_items if i["run_id"] == run_id]
+        if status is not None:
+            rows = [i for i in rows if i["status"] == status]
+        rows.sort(key=lambda i: i["id"])
+        return rows[offset : offset + limit]

@@ -154,3 +154,59 @@ class Health(BaseModel):
     status: str
     backend: str
     storage_roots: dict[str, str]
+
+
+class IntegrityItemOut(BaseModel):
+    id: int | None = None
+    run_id: int | None = None
+    ingest_id: int | None
+    message_pk: int | None = None
+    attachment_id: int | None = None
+    message_id: str | None = None
+    subject: str | None = None
+    mime_path: str | None = None
+    target_type: str
+    storage_path: str | None = None
+    expected_sha256: str | None = None
+    expected_size: int | None = None
+    actual_sha256: str | None = None
+    actual_size: int | None = None
+    status: str
+    error_code: str | None = None
+    error_detail: str | None = None
+    checked_at: datetime | None = None
+
+
+class IntegrityRunOut(BaseModel):
+    id: int
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: str
+    scope: str
+    scope_ingest_ids: list[int] = Field(default_factory=list)
+    ingest_count: int
+    item_count: int
+    passed_count: int
+    failed_count: int
+    skipped_count: int
+    items: list[IntegrityItemOut] = Field(default_factory=list)
+
+
+class IntegrityRunSummary(BaseModel):
+    id: int
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: str
+    scope: str
+    scope_ingest_ids: list[int] = Field(default_factory=list)
+    ingest_count: int
+    item_count: int
+    passed_count: int
+    failed_count: int
+    skipped_count: int
+
+
+class IntegrityPatrolRequest(BaseModel):
+    # None / omitted patrols every ingest batch; an explicit list scopes the
+    # run to those ingest ids. An empty list is treated as whole-archive too.
+    ingest_ids: list[int] | None = None

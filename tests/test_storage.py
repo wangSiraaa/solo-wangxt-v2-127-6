@@ -67,3 +67,45 @@ def test_attachment_bytes_never_logged(tmp_path, caplog):
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert "SECRET-ATTACHMENT-CONTENT-XYZ" not in blob
     assert "doc.bin" in blob  # metadata is fine
+
+
+def test_verify_file_detects_tamper_and_missing(tmp_path):
+    import hashlib
+
+    store = ControlledStorage(tmp_path / "root")
+    data = b"integrity-bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    rel = store.store_attachment(data, digest, "doc.bin")
+
+    ok = store.verify_file(rel, len(data), digest)
+    assert ok == {"ok": True, "byte_size": len(data), "sha256": digest}
+
+    # same length, different bytes -> sha256 mismatch (size alone can't see it)
+    target = store.resolve(rel)
+    target.write_bytes(b"integrity-BYTES")
+    bad = store.verify_file(rel, len(data), digest)
+    assert bad["ok"] is False and bad["error"] == "sha256_mismatch"
+    assert bad["actual_sha256"] == hashlib.sha256(b"integrity-BYTES").hexdigest()
+
+    # different length -> size mismatch
+    target.write_bytes(b"integrity-bytes-extended")
+    bad2 = store.verify_file(rel, len(data), digest)
+    assert bad2["error"] == "size_mismatch"
+    assert bad2["actual_size"] == len(b"integrity-bytes-extended")
+
+    # removed -> missing
+    target.unlink()
+    assert store.verify_file(rel, len(data), digest)["error"] == "missing"
+
+    # tampered recorded path -> rejected, never escapes the root
+    assert store.verify_file("../../etc/passwd", 1, "x")["error"] == "path_escape"
+
+
+def test_verify_file_is_read_only(tmp_path):
+    store = ControlledStorage(tmp_path / "root")
+    data = b"do-not-touch"
+    rel = store.store_attachment(data, "e" * 64, "x.bin")
+    mtime = store.resolve(rel).stat().st_mtime_ns
+    store.verify_file(rel, len(data), __import__("hashlib").sha256(data).hexdigest())
+    assert store.resolve(rel).stat().st_mtime_ns == mtime
+    assert store.resolve(rel).read_bytes() == data

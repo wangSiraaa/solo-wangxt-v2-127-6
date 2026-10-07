@@ -44,3 +44,37 @@ class Repository(Protocol):
     def list_failures(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None: ...
     def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None: ...
+
+    # -- integrity patrol --------------------------------------------------
+    def integrity_targets(
+        self, ingest_ids: Sequence[int] | None
+    ) -> list[dict[str, Any]]:
+        """Return every stored raw/attachment reference to be re-read.
+
+        With ``ingest_ids=None`` the scope is the whole archive; otherwise only
+        ingests whose id is in the list. Each row describes one stored blob:
+        raw ingests (even failed ones) and every attachment marked ``stored``.
+        """
+        ...
+
+    def create_integrity_run(
+        self, *, scope: str, scope_ingest_ids: Sequence[int], ingest_count: int
+    ) -> int:
+        """Open a patrol run (status ``running``); returns its id."""
+        ...
+
+    def add_integrity_items(self, run_id: int, items: Sequence[dict[str, Any]]) -> None:
+        """Append per-item results to a run."""
+        ...
+
+    def complete_integrity_run(
+        self, run_id: int, *, item_count: int, passed: int, failed: int, skipped: int
+    ) -> None: ...
+
+    def get_integrity_run(self, run_id: int) -> dict[str, Any] | None: ...
+
+    def list_integrity_runs(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
+
+    def list_integrity_items(
+        self, run_id: int, *, status: str | None = None, limit: int = 500, offset: int = 0
+    ) -> list[dict[str, Any]]: ...

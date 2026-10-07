@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
 
 from app.config import Settings, get_settings
+from app.integrity import IntegrityService, UnknownIngestsError
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
@@ -20,6 +21,10 @@ from app.schemas import (
     Health,
     IngestDetail,
     IngestResponse,
+    IntegrityItemOut,
+    IntegrityPatrolRequest,
+    IntegrityRunOut,
+    IntegrityRunSummary,
     MessageDetail,
     MessageSummary,
     SearchResponse,
@@ -47,6 +52,9 @@ class AppState:
             self.backend = "memory"
         self.repo.init_schema()
         self.service = IngestService(self.repo, self.raw_storage, self.attachment_storage)
+        self.integrity = IntegrityService(
+            self.repo, self.raw_storage, self.attachment_storage
+        )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -161,6 +169,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         offset: int = Query(0, ge=0),
     ) -> list[dict[str, Any]]:
         return get_state(request).repo.list_failures(limit, offset)
+
+    # ---- integrity patrols (read-only) -----------------------------------
+    @app.post("/integrity/patrol", response_model=IntegrityRunOut, tags=["integrity"])
+    def run_integrity_patrol(
+        request: Request, body: IntegrityPatrolRequest | None = None
+    ) -> dict[str, Any]:
+        st = get_state(request)
+        ids = body.ingest_ids if body and body.ingest_ids else None
+        try:
+            return st.integrity.run_patrol(ids)
+        except UnknownIngestsError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"unknown ingest ids: {exc.missing}"
+            )
+
+    @app.get("/integrity/runs", response_model=list[IntegrityRunSummary], tags=["integrity"])
+    def list_integrity_runs(
+        request: Request,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        return get_state(request).repo.list_integrity_runs(limit, offset)
+
+    @app.get("/integrity/runs/{run_id}", response_model=IntegrityRunOut, tags=["integrity"])
+    def get_integrity_run(request: Request, run_id: int) -> dict[str, Any]:
+        run = get_state(request).repo.get_integrity_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="integrity run not found")
+        return run
+
+    @app.get(
+        "/integrity/runs/{run_id}/items",
+        response_model=list[IntegrityItemOut],
+        tags=["integrity"],
+    )
+    def list_integrity_items(
+        request: Request,
+        run_id: int,
+        status_filter: str | None = Query(None, alias="status"),
+        limit: int = Query(500, ge=1, le=2000),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        st = get_state(request)
+        if st.repo.get_integrity_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="integrity run not found")
+        if status_filter is not None and status_filter not in {"passed", "failed", "skipped"}:
+            raise HTTPException(
+                status_code=422,
+                detail="status must be one of passed, failed, skipped",
+            )
+        return st.repo.list_integrity_items(
+            run_id, status=status_filter, limit=limit, offset=offset
+        )
+
+    @app.get(
+        "/integrity/runs/{run_id}/failures",
+        response_model=list[IntegrityItemOut],
+        tags=["integrity"],
+    )
+    def list_integrity_failures(
+        request: Request,
+        run_id: int,
+        limit: int = Query(500, ge=1, le=2000),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        st = get_state(request)
+        if st.repo.get_integrity_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="integrity run not found")
+        return st.repo.list_integrity_items(
+            run_id, status="failed", limit=limit, offset=offset
+        )
 
     # ---- threads ---------------------------------------------------------
     @app.get("/threads", response_model=list[ThreadSummary], tags=["threads"])

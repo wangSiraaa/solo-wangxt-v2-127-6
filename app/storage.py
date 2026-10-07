@@ -18,6 +18,7 @@ import logging
 import os
 import re
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 log = logging.getLogger("emlarchive.storage")
 
@@ -145,3 +146,58 @@ class ControlledStorage:
             return self.resolve(relative_path).is_file()
         except StorageError:
             return False
+
+    def verify_file(self, relative_path: str, expected_size: int, expected_sha256: str) -> dict[str, Any]:
+        """Read-only integrity re-check of one stored blob.
+
+        Never creates, overwrites or deletes anything. The stored relative
+        path is re-validated against the root, the file is streamed back in
+        chunks and its byte size and SHA-256 are compared with the recorded
+        values. Returns a result dict with ``ok`` and, on failure, a stable
+        ``error`` code plus expected/actual facts for the patrol report::
+
+            {"ok": True, "byte_size": 12, "sha256": "..."}
+            {"ok": False, "error": "missing" | "not_a_file" | "size_mismatch"
+                                   | "sha256_mismatch" | "unreadable"
+                                   | "path_escape", ...}
+        """
+        try:
+            target = self.resolve(relative_path)
+        except StorageError as exc:
+            return {"ok": False, "error": "path_escape", "detail": str(exc)}
+        try:
+            if not target.exists():
+                return {"ok": False, "error": "missing"}
+            if not target.is_file():
+                return {"ok": False, "error": "not_a_file"}
+        except OSError as exc:
+            return {"ok": False, "error": "unreadable", "detail": str(exc)}
+        hasher = hashlib.sha256()
+        actual_size = 0
+        try:
+            with open(target, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    actual_size += len(chunk)
+        except OSError as exc:
+            return {"ok": False, "error": "unreadable", "detail": str(exc)}
+        if actual_size != expected_size:
+            return {
+                "ok": False,
+                "error": "size_mismatch",
+                "expected_size": expected_size,
+                "actual_size": actual_size,
+            }
+        actual_sha = hasher.hexdigest()
+        if actual_sha != expected_sha256:
+            return {
+                "ok": False,
+                "error": "sha256_mismatch",
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha,
+                "actual_size": actual_size,
+            }
+        return {"ok": True, "byte_size": actual_size, "sha256": actual_sha}

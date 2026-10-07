@@ -61,7 +61,36 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
 | GET | `/failures` | failed/defective ingests with their defect lists |
+| POST | `/integrity/patrol` | read-only integrity re-read (all batches or `{"ingest_ids":[…]}`); returns run + every item |
+| GET | `/integrity/runs` / `/integrity/runs/{id}` | patrol history / one run with all per-item results |
+| GET | `/integrity/runs/{id}/failures` | failed items only — locates mail (Message-ID, subject) and MIME path |
+| GET | `/integrity/runs/{id}/items?status=passed\|failed\|skipped` | filtered per-item results |
 | GET | `/health` | backend and configured storage roots |
+
+## Integrity patrols
+
+Archivists periodically need proof that the stored bytes still match the
+facts recorded at ingest. `POST /integrity/patrol` re-reads, per ingest
+batch, the raw EML in the raw root and every stored attachment in the
+attachment root, and compares the on-disk **size and SHA-256** with the
+recorded values (`app/integrity.py`).
+
+* **Strictly read-only**: it only opens files for reading. Evidence is never
+  overwritten, repaired, moved or deleted — a missing file is reported
+  forever (and its download keeps returning `410`) until an external
+  procedure restores it.
+* **One corrupt file never aborts the batch**: every reference gets its own
+  item row with `passed` / `failed` / `skipped` and a stable error code
+  (`missing`, `not_a_file`, `unreadable`, `size_mismatch`, `sha256_mismatch`,
+  `path_escape`). `skipped` marks references known to be dangling since
+  ingest time (e.g. an attachment whose storage write failed).
+* **Failures are locatable**: each item persists ingest id, message pk,
+  RFC Message-ID, subject, attachment id, MIME path, stored relative path,
+  expected/actual size and digest, and the check time.
+* **Every run is persisted**: start/finish time, scope (`all` / `ingests`),
+  counters and all items are appended (`integrity_runs`, `integrity_items`);
+  repeating a patrol leaves a separate historical record. The in-memory and
+  PostgreSQL repositories expose identical semantics.
 
 ## Running
 
@@ -91,7 +120,7 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
 ```
@@ -112,13 +141,14 @@ app/
     eml_parser.py      stdlib email parsing, structural walk, charset ladder
     html_sanitizer.py  allow-list sanitizer + escaping + text extraction
     models.py          structured result dataclasses
-  storage.py           ControlledStorage (path safety, 0600, metadata logs)
+  storage.py           ControlledStorage (path safety, 0600, metadata logs, read-only verify_file)
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
+  integrity.py         read-only patrol: re-read/verify blobs, per-item fault isolation
   pg_repository.py     PostgreSQL persistence (psycopg3)
   memory_repository.py same interface, in-memory (tests / demo)
   service.py           parse -> store -> persist -> thread orchestration
   main.py / schemas.py FastAPI app and response models
-  sql/schema.sql       DDL (ids intentionally non-unique)
+  sql/schema.sql       DDL (ids intentionally non-unique; integrity_runs/integrity_items)
 scripts/generate_samples.py
 samples/               generated edge-case EML files
 tests/                 unit, API and PostgreSQL integration tests

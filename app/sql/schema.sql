@@ -119,3 +119,47 @@ CREATE TABLE IF NOT EXISTS thread_runs (
 
 -- Provenance link: raw EML digest -> every ingest/parse result of that bytes.
 CREATE INDEX IF NOT EXISTS idx_ingests_sha ON ingests(raw_sha256);
+
+-- Read-only integrity patrols: re-read stored raw EMLs and attachments and
+-- compare recorded size / SHA-256. Patrols never overwrite or delete evidence;
+-- they only append rows here. Repeating a patrol appends another run.
+CREATE TABLE IF NOT EXISTS integrity_runs (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at     TIMESTAMPTZ,
+    status          TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running','completed')),
+    scope           TEXT NOT NULL CHECK (scope IN ('all','ingests')),
+    scope_ingest_ids JSONB NOT NULL DEFAULT '[]',
+    ingest_count    INT NOT NULL DEFAULT 0,
+    item_count      INT NOT NULL DEFAULT 0,
+    passed_count    INT NOT NULL DEFAULT 0,
+    failed_count    INT NOT NULL DEFAULT 0,
+    skipped_count   INT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_integrity_runs_started ON integrity_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS integrity_items (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id          BIGINT NOT NULL REFERENCES integrity_runs(id) ON DELETE CASCADE,
+    ingest_id       BIGINT REFERENCES ingests(id) ON DELETE CASCADE,
+    message_pk      BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+    attachment_id   BIGINT,
+    message_id      TEXT,
+    subject         TEXT,
+    mime_path       TEXT,
+    target_type     TEXT NOT NULL CHECK (target_type IN ('raw','attachment')),
+    storage_path    TEXT,
+    expected_sha256 TEXT,
+    expected_size   BIGINT,
+    actual_sha256   TEXT,
+    actual_size     BIGINT,
+    status          TEXT NOT NULL CHECK (status IN ('passed','failed','skipped')),
+    error_code      TEXT,
+    error_detail    TEXT,
+    checked_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_integrity_items_run ON integrity_items(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_integrity_items_failures
+    ON integrity_items(run_id) WHERE status = 'failed';
+CREATE INDEX IF NOT EXISTS idx_integrity_items_ingest ON integrity_items(ingest_id);

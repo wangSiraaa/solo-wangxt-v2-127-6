@@ -374,6 +374,170 @@ class PgRepository:
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
 
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM attachments WHERE id = %s AND message_pk = %s",
+                (attachment_id, message_pk),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            return _jsonify(dict(zip(cols, row)))
+
+    # -- integrity patrol --------------------------------------------------
+    def integrity_targets(self, ingest_ids: Sequence[int] | None) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM (
+                    SELECT i.id AS ingest_id, m.id AS message_pk, 'raw' AS target_type,
+                           0 AS type_ord,
+                           NULL::bigint AS attachment_id, m.message_id, m.subject,
+                           NULL::text AS mime_path, i.raw_path AS storage_path,
+                           i.raw_sha256 AS expected_sha256, i.raw_size AS expected_size,
+                           (i.raw_path IS NOT NULL) AS stored
+                    FROM ingests i
+                    LEFT JOIN messages m ON m.ingest_id = i.id
+                    WHERE (%s::bigint[] IS NULL OR i.id = ANY (%s::bigint[]))
+
+                    UNION ALL
+
+                    SELECT i.id AS ingest_id, a.message_pk, 'attachment' AS target_type,
+                           1 AS type_ord,
+                           a.id AS attachment_id, m.message_id, m.subject,
+                           a.mime_path, a.storage_path,
+                           a.checksum_sha256 AS expected_sha256, a.byte_size AS expected_size,
+                           (a.stored AND a.storage_path IS NOT NULL) AS stored
+                    FROM attachments a
+                    JOIN messages m ON m.id = a.message_pk
+                    JOIN ingests i ON i.id = m.ingest_id
+                    WHERE (%s::bigint[] IS NULL OR i.id = ANY (%s::bigint[]))
+                ) t
+                ORDER BY ingest_id, type_ord, attachment_id NULLS FIRST
+                """,
+                (list(ingest_ids) if ingest_ids is not None else None,
+                 list(ingest_ids) if ingest_ids is not None else None,
+                 list(ingest_ids) if ingest_ids is not None else None,
+                 list(ingest_ids) if ingest_ids is not None else None),
+            )
+            cols = [c.name for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            for r in rows:
+                r.pop("type_ord", None)
+            return _jsonify(rows)
+
+    def create_integrity_run(
+        self, *, scope: str, scope_ingest_ids: Sequence[int], ingest_count: int
+    ) -> int:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO integrity_runs (scope, scope_ingest_ids, ingest_count)
+                VALUES (%s, %s, %s) RETURNING id
+                """,
+                (scope, Jsonb(list(scope_ingest_ids)), ingest_count),
+            )
+            run_id = cur.fetchone()[0]
+            conn.commit()
+        return run_id
+
+    def add_integrity_items(self, run_id: int, items: Sequence[dict[str, Any]]) -> None:
+        if not items:
+            return
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO integrity_items (run_id, ingest_id, message_pk, attachment_id,
+                    message_id, subject, mime_path, target_type, storage_path,
+                    expected_sha256, expected_size, actual_sha256, actual_size,
+                    status, error_code, error_detail, checked_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                [
+                    (
+                        run_id,
+                        i["ingest_id"],
+                        i["message_pk"],
+                        i["attachment_id"],
+                        i["message_id"],
+                        i["subject"],
+                        i["mime_path"],
+                        i["target_type"],
+                        i["storage_path"],
+                        i["expected_sha256"],
+                        i["expected_size"],
+                        i["actual_sha256"],
+                        i["actual_size"],
+                        i["status"],
+                        i["error_code"],
+                        i["error_detail"],
+                        _dt(i["checked_at"]),
+                    )
+                    for i in items
+                ],
+            )
+            conn.commit()
+
+    def complete_integrity_run(
+        self, run_id: int, *, item_count: int, passed: int, failed: int, skipped: int
+    ) -> None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE integrity_runs
+                   SET status = 'completed', finished_at = now(),
+                       item_count = %s, passed_count = %s,
+                       failed_count = %s, skipped_count = %s
+                 WHERE id = %s
+                """,
+                (item_count, passed, failed, skipped, run_id),
+            )
+            conn.commit()
+
+    def get_integrity_run(self, run_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM integrity_runs WHERE id = %s", (run_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            run = _jsonify(dict(zip(cols, row)))
+            cur.execute(
+                "SELECT * FROM integrity_items WHERE run_id = %s ORDER BY id",
+                (run_id,),
+            )
+            icols = [c.name for c in cur.description]
+            run["items"] = _jsonify([dict(zip(icols, r)) for r in cur.fetchall()])
+            return run
+
+    def list_integrity_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM integrity_runs ORDER BY id DESC LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
+    def list_integrity_items(
+        self, run_id: int, *, status: str | None = None, limit: int = 500, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM integrity_items
+                WHERE run_id = %s AND (%s::text IS NULL OR status = %s)
+                ORDER BY id LIMIT %s OFFSET %s
+                """,
+                (run_id, status, status, limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
 
 def _jsonify(value: Any) -> Any:
     """Decode Jsonb values already parsed by psycopg (dicts/lists) — pass through."""
